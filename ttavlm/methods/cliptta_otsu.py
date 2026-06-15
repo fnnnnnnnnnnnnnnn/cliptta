@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
+from skimage.filters import threshold_otsu as sk_otsu
 from copy import deepcopy
 
 from ttavlm.methods.abstract_model import AbstractOpenSetTTAModel
@@ -72,6 +73,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
     ) -> Tensor:
         image_features = self.get_features(images)
         logits = self.get_logits(image_features)
+        extended_logits = self.get_extended_logits(image_features)
 
         # Regularization loss
         if self.beta_reg != 0:
@@ -82,9 +84,9 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
         # OOD loss computation
         if self.use_ood_loss or self.detect_ood:
-            scores = self.get_scores(logits, image_features[0])
+            scores = self.get_known_confidence(extended_logits)
             if self.use_ood_loss:
-                loss_ood = self.get_otsu_loss(scores)
+                loss_ood = self.compute_oce_loss(scores)
             else:
                 loss_ood = 0.0
         else:
@@ -92,7 +94,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
         # OOD-ID separation
         if self.detect_ood:
-            images, image_features = self.filter_id(images, image_features, scores, self.alpha if self.update_alpha else None)
+            images, image_features = self.filter_id(images, image_features, scores, self.alpha)
 
         # Compute TTA loss using samples from the batch
         loss_tta = self.compute_loss_tta(image_features)
@@ -144,11 +146,46 @@ class CLIPTTA(AbstractOpenSetTTAModel):
                     class_prototypes = self.class_prototypes
                 image_features = self.get_features(images)
                 logits = self.get_logits(image_features, class_prototypes)
-                scores = self.get_scores(logits, image_features)
+                scores = self.get_known_confidence(self.get_extended_logits(image_features))
         else:
             logits, scores = None, None
 
         return logits, scores
+
+    def get_known_confidence(self, extended_logits: List[Tensor]) -> Tensor:
+        """Maximum known-class probability in the extended class space."""
+        known_count = len(self.class_prototypes)
+        probabilities = [
+            (self.logit_scale * logits).softmax(dim=-1)
+            for logits in extended_logits
+        ]
+        probabilities = torch.stack(probabilities, dim=0).mean(dim=0)
+        return probabilities[:, :known_count].max(dim=-1).values
+
+    def compute_oce_loss(self, scores: Tensor) -> Tensor:
+        """Increase the confidence gap between alpha-filtered ID and OOD samples."""
+        threshold = self.alpha.detach().to(scores.device)
+        id_mask = scores >= threshold
+        ood_mask = ~id_mask
+        losses = []
+
+        if id_mask.any():
+            losses.append(-scores[id_mask].clamp_min(1e-12).log().mean())
+        if ood_mask.any():
+            losses.append(-(1.0 - scores[ood_mask]).clamp_min(1e-12).log().mean())
+
+        return torch.stack(losses).mean() if losses else scores.sum() * 0.0
+
+    def init_otsu(self, images: List[Tensor]) -> None:
+        """Initialize alpha from known confidence in the extended class space."""
+        with torch.no_grad():
+            image_features = self.get_features(images)
+            scores = self.get_known_confidence(self.get_extended_logits(image_features))
+            threshold = torch.tensor(
+                [sk_otsu(scores.detach().cpu().numpy())],
+                device=images[0].device,
+            )
+            self.alpha.data.copy_(threshold)
 
     def compute_loss_tta(self, image_features: List[Tensor]) -> Tensor:
         class_prototypes = self.extended_classification_weights
