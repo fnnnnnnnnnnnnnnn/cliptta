@@ -94,14 +94,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         if self.detect_ood:
             images, image_features = self.filter_id(images, image_features, scores, self.alpha if self.update_alpha else None)
 
-        # TTA loss computation
-        if self.update_text:
-            class_prototypes, _ = lib.get_text_features(self.class_names, self.template, self.clip_text_encoder, enable_grad=True)
-        else:
-            class_prototypes = self.class_prototypes
-
         # Compute TTA loss using samples from the batch
-        loss_tta = self.compute_loss_tta(image_features, class_prototypes)
+        loss_tta = self.compute_loss_tta(image_features)
 
         # Compute TTA loss using samples from the memory
         if self.use_memory:
@@ -118,7 +112,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             images, _, _ = self.memory.sample()
             image_features = self.get_features([images.to(image_features[0].device)])
             logits = self.get_logits(image_features)
-            loss_tta += self.compute_loss_tta(image_features, class_prototypes)
+            loss_tta += self.compute_loss_tta(image_features)
             loss_reg += lib.softmax_mean_entropy(self.logit_scale * logits[0])
 
         # Final loss
@@ -156,21 +150,28 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
         return logits, scores
 
-    def compute_loss_tta(self, image_features: List[Tensor], class_prototypes: Tensor) -> Tensor:
-        # Compute pseudo-labels
+    def compute_loss_tta(self, image_features: List[Tensor]) -> Tensor:
+        class_prototypes = self.extended_classification_weights
         logits = image_features[0] @ class_prototypes.t()
-        _, pred = logits.topk(1, 1, True, True)
-        pred_text_features = class_prototypes[pred[:, 0]]
 
-        # Compute logits (image v.s. pseudo-captions, i.e. size is B x B)
-        logits_per_image = self.logit_scale * image_features[0] @ pred_text_features.t()
-        logits_per_text = logits_per_image.t() if self.update_text else logits_per_image
+        # Soft pseudo-labels over known classes and virtual unknown classes.
+        pseudo_probs = F.softmax(self.logit_scale * logits, dim=-1)
+        soft_text_features = F.normalize(pseudo_probs @ class_prototypes, dim=-1)
+
+        # Batch-wise soft contrastive targets: samples with similar class
+        # distributions receive larger positive-pair weights.
+        soft_targets = pseudo_probs.detach() @ pseudo_probs.detach().t()
+        soft_targets = soft_targets / soft_targets.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        logits_per_image = self.logit_scale * image_features[0] @ soft_text_features.t()
+        logits_per_text = logits_per_image.t()
 
         # TTA loss
         if self.use_tent:
             loss_tta = lib.softmax_entropy(self.logit_scale * logits).mean(0)
         elif self.use_clipartt:
-            _, pred = logits.topk(self.K, 1, True, True)
+            known_logits = image_features[0] @ self.class_prototypes.t()
+            _, pred = known_logits.topk(self.K, 1, True, True)
             if self.K == 1:
                 text_features = self.class_prototypes[pred[:, 0]]
             else:
@@ -193,8 +194,9 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             if self.use_softmax_entropy:
                 loss_tta = (lib.softmax_entropy(logits_per_image).mean(0) + lib.softmax_entropy(logits_per_text).mean(0)) / 2
             else:
-                targets = torch.eye(logits_per_image.shape[0]).to(logits_per_image.device)
-                loss_tta = (self.loss_fn(logits_per_image, targets).mean(0) + self.loss_fn(logits_per_text, targets).mean(0)) / 2
+                loss_image = -(soft_targets * F.log_softmax(logits_per_image, dim=-1)).sum(dim=-1).mean()
+                loss_text = -(soft_targets * F.log_softmax(logits_per_text, dim=-1)).sum(dim=-1).mean()
+                loss_tta = (loss_image + loss_text) / 2
 
         return loss_tta
 
