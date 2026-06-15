@@ -19,6 +19,7 @@ from torch.nn.parameter import Parameter
 from torch.utils.data import DataLoader
 from scipy.stats import chisquare
 from skimage.filters import threshold_otsu as sk_otsu
+from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 
 from ttavlm.optimizers import SAM
@@ -79,6 +80,7 @@ class AbstractOpenSetTTAModel(nn.Module):
         distributed: bool = False,
         num_shots: int = 4,
         sample_size: int = 256,
+        k_unknown: int = 1,
         tsne: bool = False,
         measure_collapse: bool = False,
         measure_improvement: bool = False,
@@ -89,8 +91,12 @@ class AbstractOpenSetTTAModel(nn.Module):
         self.adaptation = adaptation
         self.model = model
         self.clip_text_encoder = clip_text_encoder
-        self.class_prototypes = class_prototypes
-        self.class_bias = class_bias
+        self.is_clip = clip_text_encoder is not None
+        if self.is_clip:
+            class_prototypes = F.normalize(class_prototypes, dim=-1)
+        self.register_buffer("class_prototypes", class_prototypes.detach().clone())
+        self.register_buffer("class_bias", None if class_bias is None else class_bias.detach().clone())
+        self.register_buffer("cluster_centers", torch.empty(0, class_prototypes.shape[-1]))
         self.normalize_features = normalize_features
         self.steps = steps
         assert steps > 0, "Number of steps for adaptation must be >= 1 step(s) to forward and update"
@@ -126,11 +132,15 @@ class AbstractOpenSetTTAModel(nn.Module):
         # Memory attributes
         self.num_shots = num_shots
         self.sample_size = sample_size
+        if k_unknown < 0:
+            raise ValueError("k_unknown must be non-negative.")
+        self.k_unknown = k_unknown
 
         # optimization attributes
-        self.update_text = update_text
-        assert self.clip_text_encoder is not None, "clip text encoder is required when update_text is True"
-        self.update_all_params = update_all_params
+        self.update_text = update_text and not self.is_clip
+        self.update_all_params = update_all_params and not self.is_clip
+        if self.is_clip and (update_text or update_all_params):
+            lib.LOGGER.info("CLIP adaptation updates only visual normalization layers; text and other parameters stay frozen.")
         self.optimizer_type = optimizer_type
         self.lr = lr
         self.lr_miss = lr_miss
@@ -182,6 +192,48 @@ class AbstractOpenSetTTAModel(nn.Module):
             image_features.append(img_features)
 
         return image_features
+
+    @torch.no_grad()
+    def initialize_cluster_centers(
+        self,
+        main_loader: DataLoader,
+        ood_loader: Optional[DataLoader] = None,
+    ) -> None:
+        """Cluster all target-domain visual features before adaptation starts."""
+        if not self.is_clip:
+            return
+
+        device = next(self.model.parameters()).device
+        was_training = self.model.training
+        self.model.eval()
+        target_features = []
+
+        try:
+            for loader in (main_loader, ood_loader):
+                if loader is None:
+                    continue
+                for batch in loader:
+                    images = batch["image"]
+                    images = images[0] if isinstance(images, (list, tuple)) else images
+                    features = self.get_features([images.to(device, non_blocking=True)])[0]
+                    target_features.append(features.float().cpu())
+        finally:
+            self.model.train(was_training)
+        if not target_features:
+            raise ValueError("Cannot initialize K-means without target-domain samples.")
+
+        target_features = torch.cat(target_features, dim=0)
+        n_clusters = len(self.class_prototypes) + self.k_unknown
+        if len(target_features) < n_clusters:
+            raise ValueError(f"K-means needs at least {n_clusters} samples, got {len(target_features)}.")
+
+        centers = KMeans(n_clusters=n_clusters, random_state=0, n_init=10).fit(
+            target_features.numpy()
+        ).cluster_centers_
+        self.cluster_centers = torch.from_numpy(centers).to(
+            device=device, dtype=self.class_prototypes.dtype
+        )
+        lib.LOGGER.info(f"Initialized {n_clusters} target-domain cluster centers.")
 
     def get_logits(
         self,
@@ -272,6 +324,7 @@ class AbstractOpenSetTTAModel(nn.Module):
         embeddings_after = [] if self.tsne else None
         labels_ood = [] if self.tsne else None
         indexer = {}
+        self.initialize_cluster_centers(main_loader, ood_loader)
         with torch.no_grad():
             for n, batch in enumerate(track_loader):
                 images = [img.cuda(non_blocking=True) for img in batch["image"]]
@@ -606,7 +659,7 @@ class AbstractOpenSetTTAModel(nn.Module):
         params = []
         if not self.update_all_params:
             for nm, m in self.model.named_modules():
-                if isinstance(m, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
                     if self.skip_top_layers:
                         if any(subnm in nm for subnm in ["layer4", "conv5_x", "blocks.9", "blocks.10", "blocks.11", "ln_post"]):
                             lib.LOGGER.info(f"Skipping {nm} params.")
@@ -646,7 +699,10 @@ class AbstractOpenSetTTAModel(nn.Module):
             elif self.update_all_params:
                 m.requires_grad_(True)
 
-        if self.update_text:
+        if self.is_clip:
+            self.clip_text_encoder.eval()
+            self.clip_text_encoder.requires_grad_(False)
+        elif self.update_text:
             lib.LOGGER.info("Configuring text encoder's layers")
             self.clip_text_encoder.train()
             # disable grad, to (re-)enable only what we update

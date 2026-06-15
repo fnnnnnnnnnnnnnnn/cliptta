@@ -196,6 +196,7 @@ def argparser() -> ArgsType:
     # Memory arguments
     parser.add_argument("--num_shots", type=int, default=4, help="Number of shots per class in the memory")
     parser.add_argument("--sample_size", type=int, default=256, help="Number of example to sample from the memory at each adaptation step")
+    parser.add_argument("--k_unknown", type=int, default=1, help="Number of unknown clusters used for target-domain K-means")
 
     # OOD detection
     parser.add_argument("--use_ood_loss", action="store_true")

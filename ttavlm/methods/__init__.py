@@ -129,6 +129,7 @@ def return_tta_model(
         "distributed": args.distributed,
         "sample_size": args.sample_size,
         "num_shots": args.num_shots,
+        "k_unknown": getattr(args, "k_unknown", 1),
         "tsne": args.tsne,
         "measure_collapse": args.measure_collapse,
         "measure_improvement": args.measure_improvement,
