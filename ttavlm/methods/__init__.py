@@ -65,7 +65,8 @@ def return_tta_model(
     LOGGER.info(f"Loading {model_type}")
     LOGGER.info(f"Using template {template[0]}")
     if args.base_model_name.startswith("clip"):
-        class_prototypes, class_bias = get_text_features(class_names, template, base_model)
+        source_template = ["A photo of a {}"]
+        class_prototypes, class_bias = get_text_features(class_names, source_template, base_model)
 
         if args.score_type == "neglabel":
             negative_prototypes, negative_bias = get_text_features(negative_classes[args.dataset], template, base_model)

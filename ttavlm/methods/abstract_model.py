@@ -17,6 +17,7 @@ from torch.optim import Optimizer
 from torch import Tensor
 from torch.nn.parameter import Parameter
 from torch.utils.data import DataLoader
+from scipy.optimize import linear_sum_assignment
 from scipy.stats import chisquare
 from skimage.filters import threshold_otsu as sk_otsu
 from sklearn.cluster import KMeans
@@ -96,7 +97,12 @@ class AbstractOpenSetTTAModel(nn.Module):
             class_prototypes = F.normalize(class_prototypes, dim=-1)
         self.register_buffer("class_prototypes", class_prototypes.detach().clone())
         self.register_buffer("class_bias", None if class_bias is None else class_bias.detach().clone())
-        self.register_buffer("cluster_centers", torch.empty(0, class_prototypes.shape[-1]))
+        self.register_buffer("cluster_centers", torch.empty(0, class_prototypes.shape[-1]), persistent=False)
+        self.register_buffer(
+            "cluster_text_similarity",
+            torch.empty(0, len(class_prototypes)),
+            persistent=False,
+        )
         self.normalize_features = normalize_features
         self.steps = steps
         assert steps > 0, "Number of steps for adaptation must be >= 1 step(s) to forward and update"
@@ -135,6 +141,17 @@ class AbstractOpenSetTTAModel(nn.Module):
         if k_unknown < 0:
             raise ValueError("k_unknown must be non-negative.")
         self.k_unknown = k_unknown
+        self.unknown_prototypes = nn.Parameter(
+            torch.zeros(
+                k_unknown,
+                class_prototypes.shape[-1],
+                device=class_prototypes.device,
+                dtype=class_prototypes.dtype,
+            ),
+            requires_grad=self.is_clip and k_unknown > 0,
+        )
+        self.register_buffer("matched_center_indices", torch.full((len(class_prototypes),), -1, dtype=torch.long))
+        self.register_buffer("unknown_center_indices", torch.full((k_unknown,), -1, dtype=torch.long))
 
         # optimization attributes
         self.update_text = update_text and not self.is_clip
@@ -166,6 +183,8 @@ class AbstractOpenSetTTAModel(nn.Module):
             self.optimizer.add_param_group({"params": self.alpha})
         if self.update_alpha_miss:
             self.optimizer.add_param_group({"params": self.alpha_miss, "lr": self.lr_miss})
+        if self.unknown_prototypes.requires_grad:
+            self.optimizer.add_param_group({"params": self.unknown_prototypes})
         self.model_state = self.copy_state(self.model)
         self.optimizer_state = self.copy_state(self.optimizer)
         if self.update_text:
@@ -193,6 +212,58 @@ class AbstractOpenSetTTAModel(nn.Module):
 
         return image_features
 
+    @property
+    def extended_class_prototypes(self) -> Tensor:
+        """Frozen known prototypes followed by trainable unknown prototypes."""
+        if not self.is_clip or self.k_unknown == 0:
+            return self.class_prototypes
+        return torch.cat(
+            (self.class_prototypes, F.normalize(self.unknown_prototypes, dim=-1)),
+            dim=0,
+        )
+
+    @property
+    def extended_classification_weights(self) -> Tensor:
+        return self.extended_class_prototypes
+
+    @torch.no_grad()
+    def match_cluster_centers(self) -> Tensor:
+        """Match centers to known classes and initialize unmatched unknown prototypes."""
+        if not self.is_clip or self.cluster_centers.numel() == 0:
+            return self.class_prototypes
+
+        centers = F.normalize(self.cluster_centers.float(), dim=-1)
+        known_prototypes = F.normalize(self.class_prototypes.float(), dim=-1)
+        cosine_similarity = centers @ known_prototypes.t()
+        self.cluster_text_similarity = cosine_similarity.to(self.class_prototypes.dtype)
+        center_indices, class_indices = linear_sum_assignment(
+            -cosine_similarity.cpu().numpy()
+        )
+
+        matched_by_class = torch.empty(
+            len(self.class_prototypes), dtype=torch.long, device=centers.device
+        )
+        matched_by_class[torch.as_tensor(class_indices, device=centers.device)] = torch.as_tensor(
+            center_indices, device=centers.device
+        )
+        matched_mask = torch.zeros(len(centers), dtype=torch.bool, device=centers.device)
+        matched_mask[matched_by_class] = True
+        unknown_indices = torch.arange(len(centers), device=centers.device)[~matched_mask]
+
+        if len(unknown_indices) != self.k_unknown:
+            raise RuntimeError(
+                f"Expected {self.k_unknown} unmatched centers, got {len(unknown_indices)}."
+            )
+
+        self.matched_center_indices.copy_(matched_by_class.to(self.matched_center_indices.device))
+        self.unknown_center_indices.copy_(unknown_indices.to(self.unknown_center_indices.device))
+        if self.k_unknown > 0:
+            self.unknown_prototypes.copy_(
+                centers[unknown_indices].to(self.unknown_prototypes.dtype)
+            )
+
+        return self.extended_class_prototypes
+
     @torch.no_grad()
     def initialize_cluster_centers(
         self,
@@ -203,7 +274,8 @@ class AbstractOpenSetTTAModel(nn.Module):
         if not self.is_clip:
             return
 
-        device = next(self.model.parameters()).device
+        feature_model = self.model.module if hasattr(self.model, "module") else self.model
+        device = next(feature_model.parameters()).device
         was_training = self.model.training
         self.model.eval()
         target_features = []
@@ -215,7 +287,9 @@ class AbstractOpenSetTTAModel(nn.Module):
                 for batch in loader:
                     images = batch["image"]
                     images = images[0] if isinstance(images, (list, tuple)) else images
-                    features = self.get_features([images.to(device, non_blocking=True)])[0]
+                    features = self.get_features(
+                        [images.to(device, non_blocking=True)], model=feature_model
+                    )[0]
                     target_features.append(features.float().cpu())
         finally:
             self.model.train(was_training)
@@ -233,6 +307,7 @@ class AbstractOpenSetTTAModel(nn.Module):
         self.cluster_centers = torch.from_numpy(centers).to(
             device=device, dtype=self.class_prototypes.dtype
         )
+        self.match_cluster_centers()
         lib.LOGGER.info(f"Initialized {n_clusters} target-domain cluster centers.")
 
     def get_logits(
@@ -247,6 +322,17 @@ class AbstractOpenSetTTAModel(nn.Module):
         logits = [img_features @ class_prototypes.t() + class_bias for img_features in image_features]
 
         return logits
+
+    def get_extended_logits(self, image_features: List[Tensor]) -> List[Tensor]:
+        """Classify features against known and virtual unknown prototypes."""
+        class_bias = self.class_bias
+        if class_bias is not None and self.k_unknown > 0:
+            class_bias = F.pad(class_bias, (0, self.k_unknown))
+        return self.get_logits(
+            image_features,
+            class_prototypes=self.extended_classification_weights,
+            class_bias=class_bias,
+        )
 
     def forward(
         self,
