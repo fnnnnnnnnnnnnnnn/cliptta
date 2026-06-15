@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=0,1 python ttavlm/main.py \
+--exp_name tent_open_visda \
+--adaptation tent \
+--distributed \
+--dataset visda \
+--ood_dataset places \
+--shift_type all \
+--steps 10 \
+--seeds 42 \
+--lr 1e-4 \
+--beta_tta 1.0 \
+--beta_reg 1.0 \
+--id_score_type max_prob \

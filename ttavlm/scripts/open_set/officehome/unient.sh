@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=0,1 python ttavlm/main.py \
+--exp_name unient_open_officehome \
+--adaptation unient \
+--distributed \
+--dataset officehome \
+--ood_dataset svhn \
+--shift_type all \
+--steps 10 \
+--seeds 42 \
+--lr 1e-4 \
+--beta_tta 1.0 \
+--beta_reg 1.0 \
+--id_score_type max_prob \

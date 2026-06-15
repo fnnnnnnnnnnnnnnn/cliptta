@@ -18,6 +18,7 @@ def argparser() -> ArgsType:
     # Dev
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--display_progress", action="store_true")
+    parser.add_argument("--env", type=str, default="local")
 
     # Directories
     parser.add_argument("--root", type=str, default="/ADD/PROJECT/ROOT")
