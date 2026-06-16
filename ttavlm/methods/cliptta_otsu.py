@@ -168,11 +168,22 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         """Maximum known-class probability in the extended class space."""
         known_count = len(self.class_prototypes)
         probabilities = [
-            (self.logit_scale * logits).softmax(dim=-1)
+            self.safe_scaled_logits(logits).softmax(dim=-1)
             for logits in extended_logits
         ]
         probabilities = torch.stack(probabilities, dim=0).mean(dim=0)
         return probabilities[:, :known_count].max(dim=-1).values
+
+    def safe_scaled_logits(self, logits: Tensor, scale: Optional[float] = None) -> Tensor:
+        scale = self.logit_scale if scale is None else scale
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        return (scale * logits).clamp(-50.0, 50.0)
+
+    def sanitize_probs(self, probs: Tensor) -> Tensor:
+        probs = torch.nan_to_num(probs.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        denom = probs.sum(dim=-1, keepdim=True)
+        uniform = torch.full_like(probs, 1.0 / probs.shape[-1])
+        return torch.where(denom > 1e-12, probs / denom.clamp_min(1e-12), uniform)
 
     def compute_oce_loss(self, scores: Tensor) -> Tensor:
         """Increase the confidence gap between alpha-filtered ID and OOD samples."""
@@ -243,9 +254,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         class_prototypes: Tensor,
     ) -> Tensor:
         num_classes = pseudo_probs.shape[-1]
-        pseudo_probs = torch.nan_to_num(pseudo_probs.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        pseudo_probs = pseudo_probs.clamp_min(0.0)
-        pseudo_probs = pseudo_probs / pseudo_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        pseudo_probs = self.sanitize_probs(pseudo_probs)
         entropy_scale = torch.log(torch.tensor(num_classes, device=pseudo_probs.device, dtype=pseudo_probs.dtype))
         u_nc = -(pseudo_probs * pseudo_probs.clamp_min(1e-12).log()).sum(dim=-1) / entropy_scale.clamp_min(1e-12)
 
@@ -303,7 +312,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         if logits.numel() == 0:
             return logits.sum() * 0.0
 
-        model_probs = F.softmax(self.logit_scale * logits, dim=-1)
+        model_probs = F.softmax(self.safe_scaled_logits(logits), dim=-1)
         negative_labels = pseudo_probs.argmin(dim=-1)
         negative_probs = model_probs[torch.arange(len(model_probs), device=logits.device), negative_labels]
         return -(1.0 - negative_probs).clamp_min(1e-12).log().mean()
@@ -314,8 +323,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
         # Soft pseudo-labels over known classes and virtual unknown classes,
         # refined by nearest-neighbor soft voting from the feature bank.
-        pseudo_probs = F.softmax(self.logit_scale * logits, dim=-1)
-        pseudo_probs = self.refine_pseudo_probs(image_features[0].detach(), pseudo_probs.detach())
+        pseudo_probs = F.softmax(self.safe_scaled_logits(logits), dim=-1)
+        pseudo_probs = self.sanitize_probs(self.refine_pseudo_probs(image_features[0].detach(), pseudo_probs.detach()))
         pseudo_labels = pseudo_probs.argmax(dim=-1)
         self.last_pseudo_labels = pseudo_labels.detach()
         if update_bank:
@@ -342,12 +351,12 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         soft_targets = selected_probs.detach() @ selected_probs.detach().t()
         soft_targets = soft_targets / soft_targets.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        logits_per_image = self.logit_scale * selected_features @ soft_text_features.t()
+        logits_per_image = self.safe_scaled_logits(selected_features @ soft_text_features.t())
         logits_per_text = logits_per_image.t()
 
         # TTA loss
         if self.use_tent:
-            loss_s_cont = lib.softmax_entropy(self.logit_scale * selected_logits).mean(0)
+            loss_s_cont = lib.softmax_entropy(self.safe_scaled_logits(selected_logits)).mean(0)
         elif self.use_clipartt:
             known_logits = selected_features @ self.class_prototypes.t()
             _, pred = known_logits.topk(self.K, 1, True, True)
@@ -367,7 +376,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             targets = F.softmax(((images_similarity + texts_similarity) / 2) / self.clipartt_temp, dim=-1)
 
             # Obtain new logits (image v.s. new prompt, i.e. size is B x B)
-            predictions = (self.logit_scale * text_features @ selected_features.t()).t()
+            predictions = self.safe_scaled_logits((text_features @ selected_features.t()).t())
             loss_s_cont = F.cross_entropy(predictions, targets)
         else:
             if self.use_softmax_entropy:
