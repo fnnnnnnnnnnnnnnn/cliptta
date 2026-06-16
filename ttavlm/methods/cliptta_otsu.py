@@ -243,20 +243,23 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         class_prototypes: Tensor,
     ) -> Tensor:
         num_classes = pseudo_probs.shape[-1]
+        pseudo_probs = torch.nan_to_num(pseudo_probs.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pseudo_probs = pseudo_probs.clamp_min(0.0)
+        pseudo_probs = pseudo_probs / pseudo_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         entropy_scale = torch.log(torch.tensor(num_classes, device=pseudo_probs.device, dtype=pseudo_probs.dtype))
         u_nc = -(pseudo_probs * pseudo_probs.clamp_min(1e-12).log()).sum(dim=-1) / entropy_scale.clamp_min(1e-12)
 
         features = F.normalize(features.float(), dim=-1)
         class_prototypes = F.normalize(class_prototypes.float(), dim=-1)
-        distances = 1.0 - features @ class_prototypes.t()
+        distances = (1.0 - features @ class_prototypes.t()).clamp_min(0.0)
         nearest = distances.topk(min(2, num_classes), dim=-1, largest=False).values
         if nearest.shape[-1] == 1:
             u_cs = torch.zeros_like(u_nc)
         else:
             u_cs = nearest[:, 0] / nearest[:, 1].clamp_min(1e-12)
 
-        p_nc = torch.exp(-u_nc).clamp(0.0, 1.0)
-        p_cs = torch.exp(-u_cs).clamp(0.0, 1.0)
+        p_nc = torch.nan_to_num(torch.exp(-u_nc), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        p_cs = torch.nan_to_num(torch.exp(-u_cs), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         mask_nc = torch.bernoulli(p_nc).bool()
         mask_cs = torch.bernoulli(p_cs).bool()
         reliable_mask = mask_nc & mask_cs
