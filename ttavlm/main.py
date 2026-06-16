@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 import ttavlm.lib as lib
 import ttavlm.configuration as config
 
-from ttavlm.datasets import return_train_val_datasets, return_ood_dataset, get_template
+from ttavlm.datasets import return_train_val_datasets, return_ood_dataset, get_template, split_open_set_dataset
 from ttavlm.datasets import CORRUPTIONS, DOMAINS, DATASET_SUITE, VISDA_DOMAINS, PACS_DOMAINS, OFFICEHOME_DOMAINS, CLEAN_DATASETS
 from ttavlm.methods import return_tta_model
 from ttavlm.models import return_base_model
@@ -44,11 +44,15 @@ def main(args: ArgsType) -> None:
             train_transform=base_transform,
             val_transform=base_transform,
         )
+        if args.source_free_open_set:
+            _, _, class_names = split_open_set_dataset(clean_val_dataset, args.known_class_ratio)
+        else:
+            class_names = clean_val_dataset.class_names
         args.max_iter = math.ceil(len(clean_val_dataset) / args.batch_size)
         template = get_template(dataset, args.template_type)
 
         # Loading TTA model
-        tta_model = return_tta_model(args.adaptation, base_model, args, template, clean_val_dataset.class_names)
+        tta_model = return_tta_model(args.adaptation, base_model, args, template, class_names)
 
         results[dataset] = lib.DictAverage()
         for seed_id, seed in enumerate(args.seeds):
@@ -96,6 +100,8 @@ def main(args: ArgsType) -> None:
                         shift=shift_type,
                         severity=severity,
                     )
+                    if args.source_free_open_set:
+                        val_dataset, split_ood_dataset, _ = split_open_set_dataset(val_dataset, args.known_class_ratio)
                     main_loader = DataLoader(
                         dataset=val_dataset,
                         batch_size=args.batch_size,
@@ -106,7 +112,16 @@ def main(args: ArgsType) -> None:
                     )
                     lib.LOGGER.info(f"Loading dataloader {main_loader.dataset.__class__.__name__}")
 
-                    if not args.closed_set:
+                    if args.source_free_open_set:
+                        ood_loader = DataLoader(
+                            split_ood_dataset,
+                            batch_size=args.ood_batch_size,
+                            shuffle=True,
+                            num_workers=args.workers,
+                            drop_last=True,
+                        )
+                        lib.LOGGER.info(f"Loading target-private dataloader {ood_loader.dataset.__class__.__name__}")
+                    elif not args.closed_set:
                         ood_dataset = return_ood_dataset(
                             ood_dataset_name=args.ood_dataset,
                             data_dir=args.dataroot,

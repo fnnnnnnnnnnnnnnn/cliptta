@@ -21,10 +21,10 @@ def argparser() -> ArgsType:
     parser.add_argument("--env", type=str, default="local")
 
     # Directories
-    parser.add_argument("--root", type=str, default="/ADD/PROJECT/ROOT")
-    parser.add_argument("--dataroot", type=str, default="/ADD/DATASETS/ROOT/")
-    parser.add_argument("--save_root", type=str, default="work/", help="Path for base training weights")
-    parser.add_argument("--save-iter", type=str, default="work/", help="Path for base training weights")
+    parser.add_argument("--root", type=str, default="/media/fnn/cliptta/ttavlm")
+    parser.add_argument("--dataroot", type=str, default="/media/fnn/cliptta/ttavlm/data")
+    parser.add_argument("--save_root", type=str, default="/media/fnn/cliptta/ttavlm/result", help="Path for base training weights")
+    parser.add_argument("--save-iter", type=str, default="/media/fnn/cliptta/ttavlm/result", help="Path for base training weights")
     parser.add_argument("--seeds", default=[42, 43, 44], type=int, help="List of random seeds", nargs="+")
 
     # Model
@@ -87,6 +87,8 @@ def argparser() -> ArgsType:
     parser.add_argument("--batch_size", default=128, type=int)
     parser.add_argument("--workers", type=int, default=8, help="Number of workers for dataloader")
     parser.add_argument("--template_type", type=str, default="default", choices=["default", "select", "all"])
+    parser.add_argument("--source_free_open_set", action="store_true", help="Split target-domain classes into known and unknown sets")
+    parser.add_argument("--known_class_ratio", type=float, default=0.5, help="Fraction of target classes used as shared known classes")
 
     # OOD Dataset
     parser.add_argument(

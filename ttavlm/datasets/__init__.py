@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Optional, List
+from typing import Callable, Tuple, Optional, List, Dict, Union
 import os
 
 from PIL import Image
@@ -188,6 +188,57 @@ def get_train_transform() -> transforms.Compose:
             ),
         ],
     )
+
+
+class OpenSetClassSplit(Dataset):
+    def __init__(
+        self,
+        dataset: Dataset,
+        known_classes: List[str],
+        unknown: bool = False,
+    ) -> None:
+        self.dataset = dataset
+        self.known_classes = known_classes
+        self.unknown = unknown
+        self.shift_type = getattr(dataset, "shift_type", "original")
+        self.class_names = known_classes
+        class_to_idx = getattr(dataset, "class_to_idx")
+        known_ids = {class_to_idx[name] for name in known_classes}
+        targets = getattr(dataset, "targets")
+        if unknown:
+            self.indices = [i for i, target in enumerate(targets) if target not in known_ids]
+            self.labels = [-1] * len(self.indices)
+        else:
+            self.indices = [i for i, target in enumerate(targets) if target in known_ids]
+            self.target_map = {
+                class_to_idx[name]: idx
+                for idx, name in enumerate(known_classes)
+            }
+            self.labels = [self.target_map[targets[i]] for i in self.indices]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> Dict[str, Union[Tensor, str, int]]:
+        sample = self.dataset[self.indices[index]]
+        sample = dict(sample)
+        sample["target"] = -1 if self.unknown else self.labels[index]
+        return sample
+
+
+def split_open_set_dataset(
+    dataset: Dataset,
+    known_class_ratio: float,
+) -> Tuple[Dataset, Dataset, List[str]]:
+    if not 0.0 < known_class_ratio < 1.0:
+        raise ValueError("known_class_ratio must be between 0 and 1 for open-set class splitting.")
+
+    class_names = list(getattr(dataset, "class_names"))
+    num_known = max(1, min(len(class_names) - 1, int(round(len(class_names) * known_class_ratio))))
+    known_classes = class_names[:num_known]
+    id_dataset = OpenSetClassSplit(dataset, known_classes=known_classes, unknown=False)
+    ood_dataset = OpenSetClassSplit(dataset, known_classes=known_classes, unknown=True)
+    return id_dataset, ood_dataset, known_classes
 
 
 def return_train_val_datasets(
