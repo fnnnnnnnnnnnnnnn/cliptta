@@ -231,6 +231,39 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             self.feature_bank_features = self.feature_bank_features[-self.feature_bank_size:]
             self.feature_bank_probs = self.feature_bank_probs[-self.feature_bank_size:]
 
+    @torch.no_grad()
+    def reliable_sample_mask(
+        self,
+        features: Tensor,
+        pseudo_probs: Tensor,
+        class_prototypes: Tensor,
+    ) -> Tensor:
+        num_classes = pseudo_probs.shape[-1]
+        entropy_scale = torch.log(torch.tensor(num_classes, device=pseudo_probs.device, dtype=pseudo_probs.dtype))
+        u_nc = -(pseudo_probs * pseudo_probs.clamp_min(1e-12).log()).sum(dim=-1) / entropy_scale.clamp_min(1e-12)
+
+        features = F.normalize(features.float(), dim=-1)
+        class_prototypes = F.normalize(class_prototypes.float(), dim=-1)
+        distances = 1.0 - features @ class_prototypes.t()
+        nearest = distances.topk(min(2, num_classes), dim=-1, largest=False).values
+        if nearest.shape[-1] == 1:
+            u_cs = torch.zeros_like(u_nc)
+        else:
+            u_cs = nearest[:, 0] / nearest[:, 1].clamp_min(1e-12)
+
+        p_nc = torch.exp(-u_nc).clamp(0.0, 1.0)
+        p_cs = torch.exp(-u_cs).clamp(0.0, 1.0)
+        mask_nc = torch.bernoulli(p_nc).bool()
+        mask_cs = torch.bernoulli(p_cs).bool()
+        reliable_mask = mask_nc & mask_cs
+
+        self.last_u_nc = u_nc.detach()
+        self.last_u_cs = u_cs.detach()
+        self.last_p_nc = p_nc.detach()
+        self.last_p_cs = p_cs.detach()
+        self.last_reliable_mask = reliable_mask.detach()
+        return reliable_mask
+
     def compute_loss_tta(self, image_features: List[Tensor], update_bank: bool = True) -> Tensor:
         class_prototypes = self.extended_classification_weights
         logits = image_features[0] @ class_prototypes.t()
@@ -244,21 +277,33 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         if update_bank:
             self.update_feature_bank(image_features[0].detach(), pseudo_probs.detach())
 
-        soft_text_features = F.normalize(pseudo_probs.to(class_prototypes.dtype) @ class_prototypes, dim=-1)
+        reliable_mask = self.reliable_sample_mask(
+            image_features[0].detach(),
+            pseudo_probs.detach(),
+            class_prototypes.detach(),
+        )
+        if not reliable_mask.any():
+            return logits.sum() * 0.0
+
+        selected_features = image_features[0][reliable_mask]
+        selected_probs = pseudo_probs[reliable_mask]
+        selected_logits = logits[reliable_mask]
+
+        soft_text_features = F.normalize(selected_probs.to(class_prototypes.dtype) @ class_prototypes, dim=-1)
 
         # Batch-wise soft contrastive targets: samples with similar class
         # distributions receive larger positive-pair weights.
-        soft_targets = pseudo_probs.detach() @ pseudo_probs.detach().t()
+        soft_targets = selected_probs.detach() @ selected_probs.detach().t()
         soft_targets = soft_targets / soft_targets.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        logits_per_image = self.logit_scale * image_features[0] @ soft_text_features.t()
+        logits_per_image = self.logit_scale * selected_features @ soft_text_features.t()
         logits_per_text = logits_per_image.t()
 
         # TTA loss
         if self.use_tent:
-            loss_tta = lib.softmax_entropy(self.logit_scale * logits).mean(0)
+            loss_tta = lib.softmax_entropy(self.logit_scale * selected_logits).mean(0)
         elif self.use_clipartt:
-            known_logits = image_features[0] @ self.class_prototypes.t()
+            known_logits = selected_features @ self.class_prototypes.t()
             _, pred = known_logits.topk(self.K, 1, True, True)
             if self.K == 1:
                 text_features = self.class_prototypes[pred[:, 0]]
@@ -271,12 +316,12 @@ class CLIPTTA(AbstractOpenSetTTAModel):
                     text_features = self.clip_text_encoder(pred_inputs)
                     text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
-            images_similarity = image_features[0] @ image_features[0].t()
+            images_similarity = selected_features @ selected_features.t()
             texts_similarity = text_features @ text_features.t()
             targets = F.softmax(((images_similarity + texts_similarity) / 2) / self.clipartt_temp, dim=-1)
 
             # Obtain new logits (image v.s. new prompt, i.e. size is B x B)
-            predictions = (self.logit_scale * text_features @ image_features[0].t()).t()
+            predictions = (self.logit_scale * text_features @ selected_features.t()).t()
             loss_tta = F.cross_entropy(predictions, targets)
         else:
             if self.use_softmax_entropy:
