@@ -38,6 +38,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         clipartt_temp: Optional[float] = 0.01,
         feature_bank_size: int = 16384,
         n_neighbors: int = 3,
+        beta_cluster: float = 0.1,
+        beta_nl: float = 0.1,
         **kwargs: Kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -52,6 +54,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         self.clipartt_temp = clipartt_temp
         self.feature_bank_size = feature_bank_size
         self.n_neighbors = n_neighbors
+        self.beta_cluster = beta_cluster
+        self.beta_nl = beta_nl
         self.loss_fn = nn.CrossEntropyLoss(reduction="none")
 
         bank_dim = len(self.extended_classification_weights)
@@ -83,29 +87,15 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         logits = self.get_logits(image_features)
         extended_logits = self.get_extended_logits(image_features)
 
-        # Regularization loss
-        if self.beta_reg != 0:
-            logits = self.get_logits(image_features)
-            loss_reg = lib.softmax_mean_entropy(self.logit_scale * logits[0])
-        else:
-            loss_reg = 0.0
-
-        # OOD loss computation
-        if self.use_ood_loss or self.detect_ood:
-            scores = self.get_known_confidence(extended_logits)
-            if self.use_ood_loss:
-                loss_ood = self.compute_oce_loss(scores)
-            else:
-                loss_ood = 0.0
-        else:
-            loss_ood = 0.0
+        scores = self.get_known_confidence(extended_logits)
+        loss_ood = self.compute_oce_loss(scores)
 
         # OOD-ID separation
         if self.detect_ood:
             images, image_features = self.filter_id(images, image_features, scores, self.alpha)
 
-        # Compute TTA loss using samples from the batch
-        loss_tta = self.compute_loss_tta(image_features)
+        # Compute TTA losses using samples from the batch
+        loss_s_cont, loss_nl = self.compute_loss_tta(image_features)
 
         # Compute TTA loss using samples from the memory
         if self.use_memory:
@@ -122,11 +112,18 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             images, _, _ = self.memory.sample()
             image_features = self.get_features([images.to(image_features[0].device)])
             logits = self.get_logits(image_features)
-            loss_tta += self.compute_loss_tta(image_features, update_bank=False)
-            loss_reg += lib.softmax_mean_entropy(self.logit_scale * logits[0])
+            loss_s_cont_mem, loss_nl_mem = self.compute_loss_tta(image_features, update_bank=False)
+            loss_s_cont += loss_s_cont_mem
+            loss_nl += loss_nl_mem
 
         # Final loss
-        loss = self.beta_tta * loss_tta - self.beta_reg * loss_reg + self.beta_ood * loss_ood
+        loss_cluster = self.compute_cluster_loss()
+        loss = (
+            loss_s_cont
+            + self.beta_ood * loss_ood
+            + self.beta_cluster * loss_cluster
+            + self.beta_nl * loss_nl
+        )
 
         loss.backward()
         return loss
@@ -264,6 +261,43 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         self.last_reliable_mask = reliable_mask.detach()
         return reliable_mask
 
+    def compute_cluster_loss(self) -> Tensor:
+        if self.k_unknown == 0 or self.cluster_centers.numel() == 0:
+            return self.unknown_prototypes.sum() * 0.0
+
+        valid_indices = self.unknown_center_indices >= 0
+        if not valid_indices.any():
+            return self.unknown_prototypes.sum() * 0.0
+
+        unknown_prototypes = F.normalize(self.unknown_prototypes[valid_indices], dim=-1)
+        target_centers = F.normalize(
+            self.cluster_centers[self.unknown_center_indices[valid_indices]].to(unknown_prototypes.dtype),
+            dim=-1,
+        )
+        alignment_loss = 1.0 - (unknown_prototypes * target_centers).sum(dim=-1).mean()
+
+        if len(unknown_prototypes) <= 1:
+            diversity_loss = alignment_loss.new_zeros(())
+        else:
+            similarity = unknown_prototypes @ unknown_prototypes.t()
+            off_diag = ~torch.eye(len(unknown_prototypes), device=similarity.device, dtype=torch.bool)
+            diversity_loss = similarity[off_diag].pow(2).mean()
+
+        return alignment_loss + diversity_loss
+
+    def compute_negative_learning_loss(
+        self,
+        logits: Tensor,
+        pseudo_probs: Tensor,
+    ) -> Tensor:
+        if logits.numel() == 0:
+            return logits.sum() * 0.0
+
+        model_probs = F.softmax(self.logit_scale * logits, dim=-1)
+        negative_labels = pseudo_probs.argmin(dim=-1)
+        negative_probs = model_probs[torch.arange(len(model_probs), device=logits.device), negative_labels]
+        return -(1.0 - negative_probs).clamp_min(1e-12).log().mean()
+
     def compute_loss_tta(self, image_features: List[Tensor], update_bank: bool = True) -> Tensor:
         class_prototypes = self.extended_classification_weights
         logits = image_features[0] @ class_prototypes.t()
@@ -283,11 +317,13 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             class_prototypes.detach(),
         )
         if not reliable_mask.any():
-            return logits.sum() * 0.0
+            zero_loss = logits.sum() * 0.0
+            return zero_loss, zero_loss
 
         selected_features = image_features[0][reliable_mask]
         selected_probs = pseudo_probs[reliable_mask]
         selected_logits = logits[reliable_mask]
+        loss_nl = self.compute_negative_learning_loss(selected_logits, selected_probs.detach())
 
         soft_text_features = F.normalize(selected_probs.to(class_prototypes.dtype) @ class_prototypes, dim=-1)
 
@@ -301,7 +337,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
         # TTA loss
         if self.use_tent:
-            loss_tta = lib.softmax_entropy(self.logit_scale * selected_logits).mean(0)
+            loss_s_cont = lib.softmax_entropy(self.logit_scale * selected_logits).mean(0)
         elif self.use_clipartt:
             known_logits = selected_features @ self.class_prototypes.t()
             _, pred = known_logits.topk(self.K, 1, True, True)
@@ -322,16 +358,16 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
             # Obtain new logits (image v.s. new prompt, i.e. size is B x B)
             predictions = (self.logit_scale * text_features @ selected_features.t()).t()
-            loss_tta = F.cross_entropy(predictions, targets)
+            loss_s_cont = F.cross_entropy(predictions, targets)
         else:
             if self.use_softmax_entropy:
-                loss_tta = (lib.softmax_entropy(logits_per_image).mean(0) + lib.softmax_entropy(logits_per_text).mean(0)) / 2
+                loss_s_cont = (lib.softmax_entropy(logits_per_image).mean(0) + lib.softmax_entropy(logits_per_text).mean(0)) / 2
             else:
                 loss_image = -(soft_targets * F.log_softmax(logits_per_image, dim=-1)).sum(dim=-1).mean()
                 loss_text = -(soft_targets * F.log_softmax(logits_per_text, dim=-1)).sum(dim=-1).mean()
-                loss_tta = (loss_image + loss_text) / 2
+                loss_s_cont = (loss_image + loss_text) / 2
 
-        return loss_tta
+        return loss_s_cont, loss_nl
 
     def _reset_extra(self) -> None:
         if self.use_memory:

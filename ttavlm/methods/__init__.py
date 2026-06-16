@@ -200,6 +200,8 @@ def return_tta_model(
             clipartt_temp=args.clipartt_temp,
             feature_bank_size=args.queue_size,
             n_neighbors=args.n_neighbors,
+            beta_cluster=getattr(args, "beta_cluster", 0.1),
+            beta_nl=getattr(args, "beta_nl", 0.1),
             **base_tta_kwargs,
         )
     elif model_type == "cliptta_old":
