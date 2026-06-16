@@ -37,6 +37,12 @@ def main(args: ArgsType) -> None:
             path_to_weights=args.save_root,
             segments=args.segments,
         )
+        if args.source_checkpoint is not None:
+            checkpoint = torch.load(args.source_checkpoint, map_location=device)
+            state_dict = checkpoint["visual_state_dict"] if "visual_state_dict" in checkpoint else checkpoint["state_dict"]
+            visual_model = base_model.visual if hasattr(base_model, "visual") else base_model
+            visual_model.load_state_dict(state_dict, strict=False)
+            lib.LOGGER.info(f"Loaded source checkpoint from {args.source_checkpoint}")
 
         _, clean_val_dataset = return_train_val_datasets(
             name=CLEAN_DATASETS[dataset],

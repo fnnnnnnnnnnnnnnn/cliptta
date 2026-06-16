@@ -25,6 +25,7 @@ def argparser() -> ArgsType:
     parser.add_argument("--dataroot", type=str, default="/media/fnn/cliptta/ttavlm/data")
     parser.add_argument("--save_root", type=str, default="/media/fnn/cliptta/ttavlm/result", help="Path for base training weights")
     parser.add_argument("--save-iter", type=str, default="/media/fnn/cliptta/ttavlm/result", help="Path for base training weights")
+    parser.add_argument("--source_checkpoint", type=str, default=None, help="Path to source-trained visual encoder checkpoint")
     parser.add_argument("--seeds", default=[42, 43, 44], type=int, help="List of random seeds", nargs="+")
 
     # Model
