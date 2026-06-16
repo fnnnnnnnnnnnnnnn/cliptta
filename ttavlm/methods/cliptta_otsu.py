@@ -36,6 +36,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         use_clipartt: bool = False,
         K: int = 3,
         clipartt_temp: Optional[float] = 0.01,
+        feature_bank_size: int = 16384,
+        n_neighbors: int = 3,
         **kwargs: Kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -48,7 +50,13 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         self.use_clipartt = use_clipartt
         self.K = K
         self.clipartt_temp = clipartt_temp
+        self.feature_bank_size = feature_bank_size
+        self.n_neighbors = n_neighbors
         self.loss_fn = nn.CrossEntropyLoss(reduction="none")
+
+        bank_dim = len(self.extended_classification_weights)
+        self.register_buffer("feature_bank_features", torch.empty(0, self.class_prototypes.shape[-1]))
+        self.register_buffer("feature_bank_probs", torch.empty(0, bank_dim))
 
         if self.use_scheduler:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, self.max_iter)
@@ -114,7 +122,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             images, _, _ = self.memory.sample()
             image_features = self.get_features([images.to(image_features[0].device)])
             logits = self.get_logits(image_features)
-            loss_tta += self.compute_loss_tta(image_features)
+            loss_tta += self.compute_loss_tta(image_features, update_bank=False)
             loss_reg += lib.softmax_mean_entropy(self.logit_scale * logits[0])
 
         # Final loss
@@ -187,13 +195,56 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             )
             self.alpha.data.copy_(threshold)
 
-    def compute_loss_tta(self, image_features: List[Tensor]) -> Tensor:
+    @torch.no_grad()
+    def refine_pseudo_probs(self, features: Tensor, pseudo_probs: Tensor) -> Tensor:
+        if self.n_neighbors <= 0 or self.feature_bank_features.numel() == 0:
+            return pseudo_probs
+
+        features = F.normalize(features.float(), dim=-1)
+        bank_features = F.normalize(self.feature_bank_features.float(), dim=-1)
+        bank_probs = self.feature_bank_probs.to(pseudo_probs.device, dtype=pseudo_probs.dtype)
+        n_neighbors = min(self.n_neighbors, len(bank_features))
+        refined_probs = []
+
+        for feats in features.split(64):
+            similarity = feats @ bank_features.t()
+            neighbor_idx = similarity.topk(n_neighbors, dim=-1, largest=True).indices
+            refined_probs.append(bank_probs[neighbor_idx].mean(dim=1))
+
+        refined_probs = torch.cat(refined_probs, dim=0)
+        return refined_probs / refined_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    @torch.no_grad()
+    def update_feature_bank(self, features: Tensor, pseudo_probs: Tensor) -> None:
+        if self.feature_bank_size <= 0:
+            return
+
+        features = F.normalize(features.detach().float(), dim=-1)
+        pseudo_probs = pseudo_probs.detach().float()
+        if self.feature_bank_features.device != features.device:
+            self.feature_bank_features = self.feature_bank_features.to(features.device)
+            self.feature_bank_probs = self.feature_bank_probs.to(features.device)
+
+        self.feature_bank_features = torch.cat((self.feature_bank_features, features), dim=0)
+        self.feature_bank_probs = torch.cat((self.feature_bank_probs, pseudo_probs), dim=0)
+        if len(self.feature_bank_features) > self.feature_bank_size:
+            self.feature_bank_features = self.feature_bank_features[-self.feature_bank_size:]
+            self.feature_bank_probs = self.feature_bank_probs[-self.feature_bank_size:]
+
+    def compute_loss_tta(self, image_features: List[Tensor], update_bank: bool = True) -> Tensor:
         class_prototypes = self.extended_classification_weights
         logits = image_features[0] @ class_prototypes.t()
 
-        # Soft pseudo-labels over known classes and virtual unknown classes.
+        # Soft pseudo-labels over known classes and virtual unknown classes,
+        # refined by nearest-neighbor soft voting from the feature bank.
         pseudo_probs = F.softmax(self.logit_scale * logits, dim=-1)
-        soft_text_features = F.normalize(pseudo_probs @ class_prototypes, dim=-1)
+        pseudo_probs = self.refine_pseudo_probs(image_features[0].detach(), pseudo_probs.detach())
+        pseudo_labels = pseudo_probs.argmax(dim=-1)
+        self.last_pseudo_labels = pseudo_labels.detach()
+        if update_bank:
+            self.update_feature_bank(image_features[0].detach(), pseudo_probs.detach())
+
+        soft_text_features = F.normalize(pseudo_probs.to(class_prototypes.dtype) @ class_prototypes, dim=-1)
 
         # Batch-wise soft contrastive targets: samples with similar class
         # distributions receive larger positive-pair weights.
@@ -240,6 +291,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
     def _reset_extra(self) -> None:
         if self.use_memory:
             self.memory.reset()
+        self.feature_bank_features = self.feature_bank_features[:0]
+        self.feature_bank_probs = self.feature_bank_probs[:0]
 
     def after_adaptation(self, **kwargs: Kwargs) -> None:
         if self.use_scheduler:
