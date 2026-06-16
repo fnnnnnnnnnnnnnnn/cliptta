@@ -124,6 +124,13 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             + self.beta_cluster * loss_cluster
             + self.beta_nl * loss_nl
         )
+        self.last_losses = {
+            "s_cont": loss_s_cont.detach(),
+            "oce": loss_ood.detach(),
+            "cluster": loss_cluster.detach(),
+            "nl": loss_nl.detach(),
+            "total": loss.detach(),
+        }
 
         loss.backward()
         return loss
