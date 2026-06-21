@@ -164,7 +164,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         if step == self.steps - 1:
             with torch.no_grad():
                 image_features = self.get_features(images)
-                logits = self.get_extended_logits(image_features)
+                logits = self.get_logits(image_features)
                 scores = self.get_known_confidence(self.get_extended_logits(image_features))
         else:
             logits, scores = None, None

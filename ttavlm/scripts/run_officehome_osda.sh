@@ -15,11 +15,12 @@ mkdir -p "${SAVE_ROOT}"
 
 for SOURCE_DOMAIN in "${DOMAINS[@]}"; do
   SOURCE_TAG="${SOURCE_DOMAIN// /_}"
-  SOURCE_CKPT="${SAVE_ROOT}/source/${SOURCE_TAG}/vit_b16_known${KNOWN_RATIO}_seed${SEED}.pt"
+  SOURCE_CKPT="${SAVE_ROOT}/source/${SOURCE_TAG}/clip_vit_b16_known${KNOWN_RATIO}_seed${SEED}.pt"
   if [[ ! -f "${SOURCE_CKPT}" ]]; then
     CUDA_VISIBLE_DEVICES="${GPU}" python -m ttavlm.fused_osda source-train \
       --dataset officehome \
       --source_domain "${SOURCE_DOMAIN}" \
+      --base_model_name "${BASE_MODEL_NAME}" \
       --dataroot "${DATA_ROOT}" \
       --save_root "${SAVE_ROOT}" \
       --known_class_ratio "${KNOWN_RATIO}" \

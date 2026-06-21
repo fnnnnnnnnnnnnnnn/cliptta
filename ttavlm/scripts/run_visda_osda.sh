@@ -10,13 +10,14 @@ SOURCE_EPOCHS="${SOURCE_EPOCHS:-10}"
 K_UNKNOWN="${K_UNKNOWN:-}"
 BASE_MODEL_NAME="${BASE_MODEL_NAME:-clip-ViT-B/16}"
 
-SOURCE_CKPT="${SAVE_ROOT}/source/train/vit_b16_known${KNOWN_RATIO}_seed${SEED}.pt"
+SOURCE_CKPT="${SAVE_ROOT}/source/train/clip_vit_b16_known${KNOWN_RATIO}_seed${SEED}.pt"
 mkdir -p "${SAVE_ROOT}"
 
 if [[ ! -f "${SOURCE_CKPT}" ]]; then
   CUDA_VISIBLE_DEVICES="${GPU}" python -m ttavlm.fused_osda source-train \
     --dataset visda \
     --source_domain train \
+    --base_model_name "${BASE_MODEL_NAME}" \
     --dataroot "${DATA_ROOT}" \
     --save_root "${SAVE_ROOT}" \
     --known_class_ratio "${KNOWN_RATIO}" \

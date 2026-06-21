@@ -4,6 +4,7 @@ from argparse import Namespace
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import ttavlm.lib as lib
@@ -11,7 +12,86 @@ from ttavlm.datasets import return_train_val_datasets, split_open_set_dataset
 from ttavlm.methods import return_tta_model
 from ttavlm.models import return_base_model
 from ttavlm.transforms import TransformList
-from ttavlm.vit_osda import train_source
+from ttavlm.source_train import build_text_features, collect_visual_norm_params
+
+
+def train_source(args: argparse.Namespace) -> str:
+    lib.setup_logger()
+    lib.fix_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    clip_model, transform = return_base_model(
+        name=args.base_model_name,
+        device=device,
+        dataset=args.dataset,
+        path_to_weights=None,
+    )
+    _, source_dataset = return_train_val_datasets(
+        name=args.dataset,
+        data_dir=args.dataroot,
+        train_transform=transform,
+        val_transform=transform,
+        shift=args.source_domain,
+    )
+    source_dataset, _, known_class_names = split_open_set_dataset(source_dataset, args.known_class_ratio)
+    source_loader = DataLoader(
+        source_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=False,
+        drop_last=False,
+    )
+
+    visual_model = clip_model.visual
+    visual_model.use_local = False
+    visual_model.train()
+    visual_model.dtype = clip_model.dtype
+    params = collect_visual_norm_params(visual_model)
+    optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+    text_features = build_text_features(clip_model, known_class_names, device).detach()
+
+    for epoch in range(args.epochs):
+        total_loss, total_correct, total_count = 0.0, 0.0, 0
+        for batch in lib.track(source_loader, f"CLIP source train {args.dataset}/{args.source_domain} epoch {epoch + 1}"):
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["target"].to(device, non_blocking=True)
+
+            image_features = visual_model(images.type(visual_model.dtype))
+            image_features = F.normalize(image_features, dim=-1)
+            logits = args.logit_scale * image_features @ text_features.t()
+            loss = F.cross_entropy(logits.float(), labels)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * labels.numel()
+            total_correct += (logits.argmax(dim=-1) == labels).float().sum().item()
+            total_count += labels.numel()
+
+        lib.LOGGER.info(
+            f"epoch={epoch + 1}/{args.epochs}, "
+            f"loss={total_loss / max(total_count, 1):.4f}, "
+            f"acc={total_correct / max(total_count, 1):.4f}"
+        )
+
+    output = args.output
+    if output is None:
+        source_tag = args.source_domain.replace(" ", "_")
+        model_tag = args.base_model_name.replace("/", "_")
+        output = os.path.join(args.save_root, "source", source_tag, f"{model_tag}_known{args.known_class_ratio}_seed{args.seed}.pt")
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    torch.save(
+        {
+            "visual_state_dict": visual_model.state_dict(),
+            "known_class_names": known_class_names,
+            "args": vars(args),
+        },
+        output,
+    )
+    lib.LOGGER.info(f"Saved CLIP source checkpoint to {output}")
+    return output
 
 
 def load_known_class_names(args: argparse.Namespace, transform) -> List[str]:
@@ -111,6 +191,11 @@ def adapt(args: argparse.Namespace) -> Dict[str, float]:
         path_to_weights=args.save_root,
         segments=0,
     )
+    if args.source_checkpoint is not None:
+        checkpoint = torch.load(args.source_checkpoint, map_location=device)
+        if "visual_state_dict" in checkpoint:
+            base_model.visual.load_state_dict(checkpoint["visual_state_dict"], strict=False)
+            lib.LOGGER.info(f"Loaded CLIP visual source checkpoint from {args.source_checkpoint}")
     val_transform = TransformList([base_transform])
     known_class_names = load_known_class_names(args, base_transform)
     num_known = len(known_class_names)
@@ -184,9 +269,11 @@ def parse_args() -> argparse.Namespace:
 
     source_parser = subparsers.add_parser("source-train", parents=[common])
     source_parser.add_argument("--source_domain", required=True)
+    source_parser.add_argument("--base_model_name", default="clip-ViT-B/16")
     source_parser.add_argument("--epochs", type=int, default=10)
     source_parser.add_argument("--lr", type=float, default=1e-4)
     source_parser.add_argument("--weight_decay", type=float, default=1e-4)
+    source_parser.add_argument("--logit_scale", type=float, default=100.0)
     source_parser.add_argument("--output", default=None)
 
     adapt_parser = subparsers.add_parser("adapt", parents=[common])
