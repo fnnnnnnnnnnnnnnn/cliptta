@@ -316,6 +316,43 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         negative_probs = model_probs[torch.arange(len(model_probs), device=logits.device), negative_labels]
         return -(1.0 - negative_probs).clamp_min(1e-12).log().mean()
 
+    def compute_nl_infonce_loss(
+        self,
+        features: Tensor,
+        pseudo_probs: Tensor,
+        known_count: int,
+    ) -> Tensor:
+        """Unknown samples use private-cluster NL-InfoNCE, not unknown text alignment."""
+        if features.shape[0] <= 1 or pseudo_probs.shape[-1] <= known_count:
+            return features.sum() * 0.0
+
+        private_probs = self.sanitize_probs(pseudo_probs[:, known_count:])
+        private_labels = private_probs.argmax(dim=-1)
+        temporal_affinity = private_probs.detach() @ private_probs.detach().t()
+
+        num_samples = features.shape[0]
+        off_diag = ~torch.eye(num_samples, device=features.device, dtype=torch.bool)
+        positive_mask = off_diag & private_labels[:, None].eq(private_labels[None, :])
+
+        # Temporally similar samples may be false negatives. Exclude them from
+        # the negative denominator unless they are explicit private positives.
+        false_negative_mask = off_diag & (temporal_affinity > 0.5) & ~positive_mask
+        denominator_mask = off_diag & ~false_negative_mask
+
+        positive_weights = temporal_affinity * positive_mask
+        valid_anchors = positive_weights.sum(dim=-1) > 1e-12
+        if not valid_anchors.any():
+            return features.sum() * 0.0
+
+        features = F.normalize(features.float(), dim=-1)
+        similarity = self.safe_scaled_logits(features @ features.t())
+        similarity = similarity.masked_fill(~denominator_mask, -torch.finfo(similarity.dtype).max)
+        log_probs = similarity - torch.logsumexp(similarity, dim=-1, keepdim=True)
+
+        positive_weights = positive_weights / positive_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        losses = -(positive_weights * log_probs).sum(dim=-1)
+        return losses[valid_anchors].mean()
+
     def compute_loss_tta(self, image_features: List[Tensor], update_bank: bool = True) -> Tensor:
         class_prototypes = self.extended_classification_weights
         known_count = len(self.class_prototypes)
@@ -344,15 +381,22 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             & (pseudo_labels < known_count)
             & uncertainty_mask
         )
+        unknown_reliable_mask = (
+            ((known_id_weights <= 0.5) | (pseudo_labels >= known_count))
+            & uncertainty_mask
+        )
 
         self.last_known_mcm_scores = known_mcm_scores.detach()
         self.last_known_id_weights = known_id_weights.detach()
         self.last_known_reliable_mask = known_reliable_mask.detach()
+        self.last_unknown_reliable_mask = unknown_reliable_mask.detach()
 
-        if uncertainty_mask.any():
-            selected_logits = logits[uncertainty_mask]
-            selected_probs = pseudo_probs[uncertainty_mask]
-            loss_nl = self.compute_negative_learning_loss(selected_logits, selected_probs.detach())
+        if unknown_reliable_mask.any():
+            loss_nl = self.compute_nl_infonce_loss(
+                image_features[0][unknown_reliable_mask],
+                pseudo_probs[unknown_reliable_mask].detach(),
+                known_count,
+            )
         else:
             loss_nl = logits.sum() * 0.0
 
