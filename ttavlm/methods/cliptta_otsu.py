@@ -163,12 +163,8 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         # Get final logits and OOD scores
         if step == self.steps - 1:
             with torch.no_grad():
-                if self.update_text:
-                    class_prototypes, _ = lib.get_text_features(self.class_names, self.template, self.clip_text_encoder)
-                else:
-                    class_prototypes = self.class_prototypes
                 image_features = self.get_features(images)
-                logits = self.get_logits(image_features, class_prototypes)
+                logits = self.get_extended_logits(image_features)
                 scores = self.get_known_confidence(self.get_extended_logits(image_features))
         else:
             logits, scores = None, None
