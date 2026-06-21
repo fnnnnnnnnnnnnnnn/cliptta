@@ -11,7 +11,6 @@ from skimage.filters import threshold_otsu as sk_otsu
 from copy import deepcopy
 
 from ttavlm.methods.abstract_model import AbstractOpenSetTTAModel
-from ttavlm.models.clip import tokenize as clip_tokenize
 from ttavlm.memory import CCM
 
 
@@ -319,6 +318,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
 
     def compute_loss_tta(self, image_features: List[Tensor], update_bank: bool = True) -> Tensor:
         class_prototypes = self.extended_classification_weights
+        known_count = len(self.class_prototypes)
         logits = image_features[0] @ class_prototypes.t()
 
         # Soft pseudo-labels over known classes and virtual unknown classes,
@@ -330,61 +330,56 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         if update_bank:
             self.update_feature_bank(image_features[0].detach(), pseudo_probs.detach())
 
-        reliable_mask = self.reliable_sample_mask(
+        uncertainty_mask = self.reliable_sample_mask(
             image_features[0].detach(),
             pseudo_probs.detach(),
             class_prototypes.detach(),
         )
-        if not reliable_mask.any():
-            zero_loss = logits.sum() * 0.0
-            return zero_loss, zero_loss
 
-        selected_features = image_features[0][reliable_mask]
-        selected_probs = pseudo_probs[reliable_mask]
-        selected_logits = logits[reliable_mask]
-        loss_nl = self.compute_negative_learning_loss(selected_logits, selected_probs.detach())
+        known_probs_for_score = F.softmax(self.safe_scaled_logits(logits[:, :known_count]), dim=-1)
+        known_mcm_scores = known_probs_for_score.max(dim=-1).values
+        known_id_weights = torch.sigmoid(known_mcm_scores - self.alpha.to(known_mcm_scores.device))
+        known_reliable_mask = (
+            (known_id_weights > 0.5)
+            & (pseudo_labels < known_count)
+            & uncertainty_mask
+        )
 
-        soft_text_features = F.normalize(selected_probs.to(class_prototypes.dtype) @ class_prototypes, dim=-1)
+        self.last_known_mcm_scores = known_mcm_scores.detach()
+        self.last_known_id_weights = known_id_weights.detach()
+        self.last_known_reliable_mask = known_reliable_mask.detach()
+
+        if uncertainty_mask.any():
+            selected_logits = logits[uncertainty_mask]
+            selected_probs = pseudo_probs[uncertainty_mask]
+            loss_nl = self.compute_negative_learning_loss(selected_logits, selected_probs.detach())
+        else:
+            loss_nl = logits.sum() * 0.0
+
+        if not known_reliable_mask.any():
+            return logits.sum() * 0.0, loss_nl
+
+        selected_features = image_features[0][known_reliable_mask]
+        selected_known_probs = self.sanitize_probs(pseudo_probs[known_reliable_mask, :known_count])
+        known_text_prototypes = self.class_prototypes.to(class_prototypes.dtype)
+        soft_text_features = F.normalize(
+            selected_known_probs.to(class_prototypes.dtype) @ known_text_prototypes,
+            dim=-1,
+        )
 
         # Batch-wise soft contrastive targets: samples with similar class
         # distributions receive larger positive-pair weights.
-        soft_targets = selected_probs.detach() @ selected_probs.detach().t()
+        soft_targets = selected_known_probs.detach() @ selected_known_probs.detach().t()
         soft_targets = soft_targets / soft_targets.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
         logits_per_image = self.safe_scaled_logits(selected_features @ soft_text_features.t())
         logits_per_text = logits_per_image.t()
 
-        # TTA loss
-        if self.use_tent:
-            loss_s_cont = lib.softmax_entropy(self.safe_scaled_logits(selected_logits)).mean(0)
-        elif self.use_clipartt:
-            known_logits = selected_features @ self.class_prototypes.t()
-            _, pred = known_logits.topk(self.K, 1, True, True)
-            if self.K == 1:
-                text_features = self.class_prototypes[pred[:, 0]]
-            else:
-                text_prompts = lib.getprompt(self.K, pred.cpu().numpy(), self.class_names, self.template[0])
-                pred_inputs = clip_tokenize(text_prompts).to(logits.device)
-
-                # With the new prompts, compute the image-to-image and text-to-text similarities to get targets
-                with torch.no_grad():
-                    text_features = self.clip_text_encoder(pred_inputs)
-                    text_features = text_features / text_features.norm(dim=1, keepdim=True)
-
-            images_similarity = selected_features @ selected_features.t()
-            texts_similarity = text_features @ text_features.t()
-            targets = F.softmax(((images_similarity + texts_similarity) / 2) / self.clipartt_temp, dim=-1)
-
-            # Obtain new logits (image v.s. new prompt, i.e. size is B x B)
-            predictions = self.safe_scaled_logits((text_features @ selected_features.t()).t())
-            loss_s_cont = F.cross_entropy(predictions, targets)
-        else:
-            if self.use_softmax_entropy:
-                loss_s_cont = (lib.softmax_entropy(logits_per_image).mean(0) + lib.softmax_entropy(logits_per_text).mean(0)) / 2
-            else:
-                loss_image = -(soft_targets * F.log_softmax(logits_per_image, dim=-1)).sum(dim=-1).mean()
-                loss_text = -(soft_targets * F.log_softmax(logits_per_text, dim=-1)).sum(dim=-1).mean()
-                loss_s_cont = (loss_image + loss_text) / 2
+        # Known-ID reliable samples use CLIPTTA's batch-aware soft
+        # image-text contrastive loss instead of per-sample entropy.
+        loss_image = -(soft_targets * F.log_softmax(logits_per_image, dim=-1)).sum(dim=-1).mean()
+        loss_text = -(soft_targets * F.log_softmax(logits_per_text, dim=-1)).sum(dim=-1).mean()
+        loss_s_cont = (loss_image + loss_text) / 2
 
         return loss_s_cont, loss_nl
 
