@@ -191,6 +191,10 @@ def argparser() -> ArgsType:
     parser.add_argument("--beta_ood", type=float, default=0.1)
     parser.add_argument("--beta_cluster", type=float, default=0.1)
     parser.add_argument("--beta_nl", type=float, default=0.1)
+    parser.add_argument("--beta_clip", type=float, default=1.0)
+    parser.add_argument("--beta_nlcls", type=float, default=None)
+    parser.add_argument("--beta_nlinfo", type=float, default=None)
+    parser.add_argument("--beta_div", type=float, default=None)
     parser.add_argument("--beta_miss", type=float, default=0.0)
 
     # Plotting & measurements

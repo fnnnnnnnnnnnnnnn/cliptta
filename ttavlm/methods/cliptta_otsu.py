@@ -39,6 +39,10 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         n_neighbors: int = 3,
         beta_cluster: float = 0.1,
         beta_nl: float = 0.1,
+        beta_clip: float = 1.0,
+        beta_nlcls: Optional[float] = None,
+        beta_nlinfo: Optional[float] = None,
+        beta_div: Optional[float] = None,
         **kwargs: Kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -53,8 +57,10 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         self.clipartt_temp = clipartt_temp
         self.feature_bank_size = feature_bank_size
         self.n_neighbors = n_neighbors
-        self.beta_cluster = beta_cluster
-        self.beta_nl = beta_nl
+        self.beta_clip = beta_clip
+        self.beta_nlcls = beta_nl if beta_nlcls is None else beta_nlcls
+        self.beta_nlinfo = beta_nl if beta_nlinfo is None else beta_nlinfo
+        self.beta_div = beta_cluster if beta_div is None else beta_div
         self.loss_fn = nn.CrossEntropyLoss(reduction="none")
 
         bank_dim = len(self.extended_classification_weights)
@@ -94,7 +100,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             images, image_features = self.filter_id(images, image_features, scores, self.alpha)
 
         # Compute TTA losses using samples from the batch
-        loss_s_cont, loss_nl = self.compute_loss_tta(image_features)
+        loss_s_cont, loss_nlcls, loss_nlinfo, loss_div = self.compute_loss_tta(image_features)
 
         # Compute TTA loss using samples from the memory
         if self.use_memory:
@@ -111,23 +117,29 @@ class CLIPTTA(AbstractOpenSetTTAModel):
             images, _, _ = self.memory.sample()
             image_features = self.get_features([images.to(image_features[0].device)])
             logits = self.get_logits(image_features)
-            loss_s_cont_mem, loss_nl_mem = self.compute_loss_tta(image_features, update_bank=False)
+            loss_s_cont_mem, loss_nlcls_mem, loss_nlinfo_mem, loss_div_mem = self.compute_loss_tta(
+                image_features,
+                update_bank=False,
+            )
             loss_s_cont += loss_s_cont_mem
-            loss_nl += loss_nl_mem
+            loss_nlcls += loss_nlcls_mem
+            loss_nlinfo += loss_nlinfo_mem
+            loss_div += loss_div_mem
 
         # Final loss
-        loss_cluster = self.compute_cluster_loss()
         loss = (
-            loss_s_cont
+            self.beta_clip * loss_s_cont
             + self.beta_ood * loss_ood
-            + self.beta_cluster * loss_cluster
-            + self.beta_nl * loss_nl
+            + self.beta_nlcls * loss_nlcls
+            + self.beta_nlinfo * loss_nlinfo
+            + self.beta_div * loss_div
         )
         self.last_losses = {
-            "s_cont": loss_s_cont.detach(),
+            "scont_known": loss_s_cont.detach(),
             "oce": loss_ood.detach(),
-            "cluster": loss_cluster.detach(),
-            "nl": loss_nl.detach(),
+            "negative_cls": loss_nlcls.detach(),
+            "nl_infonce": loss_nlinfo.detach(),
+            "div": loss_div.detach(),
             "total": loss.detach(),
         }
 
@@ -353,10 +365,23 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         losses = -(positive_weights * log_probs).sum(dim=-1)
         return losses[valid_anchors].mean()
 
+    def compute_diversity_loss(self, logits: Tensor) -> Tensor:
+        """Encourage the batch prediction average to use the extended space."""
+        if logits.numel() == 0:
+            return logits.sum() * 0.0
+
+        probs = F.softmax(self.safe_scaled_logits(logits), dim=-1)
+        mean_probs = probs.mean(dim=0)
+        num_classes = mean_probs.shape[0]
+        return (
+            mean_probs * (mean_probs.clamp_min(1e-12).log() + torch.log(mean_probs.new_tensor(num_classes)))
+        ).sum()
+
     def compute_loss_tta(self, image_features: List[Tensor], update_bank: bool = True) -> Tensor:
         class_prototypes = self.extended_classification_weights
         known_count = len(self.class_prototypes)
         logits = image_features[0] @ class_prototypes.t()
+        loss_div = self.compute_diversity_loss(logits)
 
         # Soft pseudo-labels over known classes and virtual unknown classes,
         # refined by nearest-neighbor soft voting from the feature bank.
@@ -391,17 +416,25 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         self.last_known_reliable_mask = known_reliable_mask.detach()
         self.last_unknown_reliable_mask = unknown_reliable_mask.detach()
 
+        if uncertainty_mask.any():
+            loss_nlcls = self.compute_negative_learning_loss(
+                logits[uncertainty_mask],
+                pseudo_probs[uncertainty_mask].detach(),
+            )
+        else:
+            loss_nlcls = logits.sum() * 0.0
+
         if unknown_reliable_mask.any():
-            loss_nl = self.compute_nl_infonce_loss(
+            loss_nlinfo = self.compute_nl_infonce_loss(
                 image_features[0][unknown_reliable_mask],
                 pseudo_probs[unknown_reliable_mask].detach(),
                 known_count,
             )
         else:
-            loss_nl = logits.sum() * 0.0
+            loss_nlinfo = logits.sum() * 0.0
 
         if not known_reliable_mask.any():
-            return logits.sum() * 0.0, loss_nl
+            return logits.sum() * 0.0, loss_nlcls, loss_nlinfo, loss_div
 
         selected_features = image_features[0][known_reliable_mask]
         selected_known_probs = self.sanitize_probs(pseudo_probs[known_reliable_mask, :known_count])
@@ -425,7 +458,7 @@ class CLIPTTA(AbstractOpenSetTTAModel):
         loss_text = -(soft_targets * F.log_softmax(logits_per_text, dim=-1)).sum(dim=-1).mean()
         loss_s_cont = (loss_image + loss_text) / 2
 
-        return loss_s_cont, loss_nl
+        return loss_s_cont, loss_nlcls, loss_nlinfo, loss_div
 
     def _reset_extra(self) -> None:
         if self.use_memory:

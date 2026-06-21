@@ -202,6 +202,10 @@ def return_tta_model(
             n_neighbors=args.n_neighbors,
             beta_cluster=getattr(args, "beta_cluster", 0.1),
             beta_nl=getattr(args, "beta_nl", 0.1),
+            beta_clip=getattr(args, "beta_clip", 1.0),
+            beta_nlcls=getattr(args, "beta_nlcls", None),
+            beta_nlinfo=getattr(args, "beta_nlinfo", None),
+            beta_div=getattr(args, "beta_div", None),
             **base_tta_kwargs,
         )
     elif model_type == "cliptta_old":
