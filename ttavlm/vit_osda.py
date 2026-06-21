@@ -14,6 +14,8 @@ from torchvision.transforms.functional import InterpolationMode
 
 import ttavlm.lib as lib
 from ttavlm.datasets import return_train_val_datasets, split_open_set_dataset
+from ttavlm.models.clip import load as load_clip
+from ttavlm.models.clip import tokenize as clip_tokenize
 
 
 def build_vit_b16(num_classes: int, pretrained: bool = True) -> nn.Module:
@@ -56,6 +58,76 @@ def extract_features(model: nn.Module, loader: DataLoader, device: torch.device)
             features.append(F.normalize(feats.float(), dim=-1).cpu())
     model.heads = old_heads
     return torch.cat(features, dim=0)
+
+
+@torch.no_grad()
+def build_known_text_prototypes(
+    clip_model: nn.Module,
+    class_names: List[str],
+    device: torch.device,
+    prompt_template: str = "a photo of a {}",
+) -> torch.Tensor:
+    prompts = [prompt_template.format(name.replace("_", " ")) for name in class_names]
+    tokens = clip_tokenize(prompts).to(device)
+    text_features = clip_model.encode_text(tokens)
+    return F.normalize(text_features.float(), dim=-1)
+
+
+@torch.no_grad()
+def extract_clip_image_features(
+    clip_model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> torch.Tensor:
+    clip_model.eval()
+    features = []
+    for batch in lib.track(loader, "Extract CLIP target features"):
+        images = batch["image"].to(device, non_blocking=True)
+        image_features = clip_model.encode_image(images.type(clip_model.dtype))
+        features.append(F.normalize(image_features.float(), dim=-1).cpu())
+    return torch.cat(features, dim=0)
+
+
+def build_extended_clip_prototypes(
+    clip_model: nn.Module,
+    target_loader: DataLoader,
+    known_class_names: List[str],
+    num_private_prototypes: int,
+    device: torch.device,
+    prompt_template: str = "a photo of a {}",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    known_prototypes = build_known_text_prototypes(
+        clip_model=clip_model,
+        class_names=known_class_names,
+        device=device,
+        prompt_template=prompt_template,
+    )
+    target_features = extract_clip_image_features(clip_model, target_loader, device)
+    n_clusters = len(known_class_names) + num_private_prototypes
+    if len(target_features) < n_clusters:
+        raise ValueError(f"K-means needs at least {n_clusters} samples, got {len(target_features)}.")
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+    centers = torch.from_numpy(kmeans.fit(target_features.numpy()).cluster_centers_).to(device=device, dtype=torch.float32)
+    centers = F.normalize(centers, dim=-1)
+
+    similarity = centers @ known_prototypes.t()
+    center_idx, class_idx = linear_sum_assignment(-similarity.cpu().numpy())
+
+    matched_by_class = torch.empty(len(known_class_names), dtype=torch.long, device=device)
+    matched_by_class[torch.as_tensor(class_idx, device=device)] = torch.as_tensor(center_idx, device=device)
+
+    matched_mask = torch.zeros(len(centers), dtype=torch.bool, device=device)
+    matched_mask[matched_by_class] = True
+    private_indices = torch.arange(len(centers), device=device)[~matched_mask]
+    private_prototypes = centers[private_indices]
+    if len(private_prototypes) != num_private_prototypes:
+        raise RuntimeError(
+            f"Expected {num_private_prototypes} private prototypes, got {len(private_prototypes)}."
+        )
+
+    extended_prototypes = torch.cat((known_prototypes, private_prototypes), dim=0)
+    return extended_prototypes, similarity, private_indices
 
 
 def expand_classifier_head(model: nn.Module, num_known: int) -> nn.Module:
@@ -185,13 +257,75 @@ def evaluate_osda(model: nn.Module, known_loader: DataLoader, unknown_loader: Da
     return {"OS*": os_star, "UNK": unk, "HOS": hos}
 
 
+@torch.no_grad()
+def evaluate_clip_prototypes(
+    clip_model: nn.Module,
+    prototypes: torch.Tensor,
+    known_loader: DataLoader,
+    unknown_loader: DataLoader,
+    num_known: int,
+    device: torch.device,
+    logit_scale: float,
+) -> Dict[str, float]:
+    clip_model.eval()
+    prototypes = F.normalize(prototypes.float(), dim=-1).to(device)
+    per_class_correct = torch.zeros(num_known, dtype=torch.float64)
+    per_class_total = torch.zeros(num_known, dtype=torch.float64)
+    unknown_correct, unknown_total = 0.0, 0.0
+
+    for batch in known_loader:
+        images = batch["image"].to(device, non_blocking=True)
+        labels = batch["target"].to(device, non_blocking=True)
+        features = clip_model.encode_image(images.type(clip_model.dtype))
+        features = F.normalize(features.float(), dim=-1)
+        preds = (logit_scale * (features @ prototypes.t())).argmax(dim=-1)
+        for cls in range(num_known):
+            cls_mask = labels == cls
+            per_class_total[cls] += cls_mask.sum().item()
+            per_class_correct[cls] += ((preds == labels) & cls_mask).sum().item()
+
+    for batch in unknown_loader:
+        images = batch["image"].to(device, non_blocking=True)
+        features = clip_model.encode_image(images.type(clip_model.dtype))
+        features = F.normalize(features.float(), dim=-1)
+        preds = (logit_scale * (features @ prototypes.t())).argmax(dim=-1)
+        unknown_correct += (preds >= num_known).float().sum().item()
+        unknown_total += preds.numel()
+
+    valid_classes = per_class_total > 0
+    os_star = (per_class_correct[valid_classes] / per_class_total[valid_classes]).mean().item() if valid_classes.any() else 0.0
+    unk = unknown_correct / max(unknown_total, 1.0)
+    hos = 2 * os_star * unk / (os_star + unk) if (os_star + unk) > 0 else 0.0
+    return {"OS*": os_star, "UNK": unk, "HOS": hos}
+
+
 def adapt_and_eval(args: argparse.Namespace) -> Dict[str, float]:
     lib.setup_logger()
     lib.fix_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(args.source_checkpoint, map_location=device)
-    num_known = checkpoint["num_known"]
-    transform = vit_transform()
+    clip_model, transform = load_clip(args.clip_model, device=device)
+    clip_model.eval()
+
+    if args.source_checkpoint is not None:
+        checkpoint = torch.load(args.source_checkpoint, map_location=device)
+        num_known = checkpoint["num_known"]
+        known_class_names = checkpoint.get("known_class_names")
+        if known_class_names is None:
+            raise KeyError("source checkpoint must contain known_class_names for CLIP text prototypes.")
+        if len(known_class_names) != num_known:
+            raise ValueError(
+                f"source checkpoint has num_known={num_known}, but {len(known_class_names)} known_class_names."
+            )
+    else:
+        _, source_dataset = return_train_val_datasets(
+            name=args.dataset,
+            data_dir=args.dataroot,
+            train_transform=transform,
+            val_transform=transform,
+            shift=args.source_domain,
+        )
+        _, _, known_class_names = split_open_set_dataset(source_dataset, args.known_class_ratio)
+        num_known = len(known_class_names)
 
     _, target_dataset = return_train_val_datasets(
         name=args.dataset,
@@ -205,11 +339,33 @@ def adapt_and_eval(args: argparse.Namespace) -> Dict[str, float]:
     known_loader = DataLoader(known_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     unknown_loader = DataLoader(unknown_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
 
-    model = build_vit_b16(num_known, pretrained=False).to(device)
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
-    expand_classifier_head(model, num_known)
-    init_unknown_head_with_kmeans(model, target_loader, num_known, device)
-    metrics = evaluate_osda(model, known_loader, unknown_loader, num_known, device)
+    num_private = args.num_private_prototypes if args.num_private_prototypes is not None else num_known
+    if num_private < 0:
+        raise ValueError("num_private_prototypes must be non-negative.")
+    extended_prototypes, cluster_text_similarity, private_indices = build_extended_clip_prototypes(
+        clip_model=clip_model,
+        target_loader=target_loader,
+        known_class_names=known_class_names,
+        num_private_prototypes=num_private,
+        device=device,
+        prompt_template=args.prompt_template,
+    )
+    metrics = evaluate_clip_prototypes(
+        clip_model=clip_model,
+        prototypes=extended_prototypes,
+        known_loader=known_loader,
+        unknown_loader=unknown_loader,
+        num_known=num_known,
+        device=device,
+        logit_scale=args.logit_scale,
+    )
+    lib.LOGGER.info(
+        f"Built CLIP extended prototypes: known_text={num_known}, private={num_private}, "
+        f"kmeans_clusters={num_known + num_private}, private_centroids={private_indices.cpu().tolist()}"
+    )
+    lib.LOGGER.info(
+        f"Mean matched centroid/text cosine={cluster_text_similarity.max(dim=0).values.mean().item():.4f}"
+    )
     lib.LOGGER.info(
         f"{args.dataset} {args.source_domain}->{args.target_domain}: "
         f"OS*={metrics['OS*'] * 100:.2f}, UNK={metrics['UNK'] * 100:.2f}, HOS={metrics['HOS'] * 100:.2f}"
@@ -240,7 +396,11 @@ def parse_args() -> argparse.Namespace:
     eval_parser = subparsers.add_parser("adapt-eval", parents=[common])
     eval_parser.add_argument("--source_domain", required=True)
     eval_parser.add_argument("--target_domain", required=True)
-    eval_parser.add_argument("--source_checkpoint", required=True)
+    eval_parser.add_argument("--source_checkpoint", default=None)
+    eval_parser.add_argument("--clip_model", default="ViT-B/16")
+    eval_parser.add_argument("--prompt_template", default="a photo of a {}")
+    eval_parser.add_argument("--num_private_prototypes", type=int, default=None)
+    eval_parser.add_argument("--logit_scale", type=float, default=100.0)
 
     return parser.parse_args()
 
